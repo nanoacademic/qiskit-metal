@@ -15,7 +15,7 @@ qutip==4.7.1
 scipy==1.10.0
 shapely==2.0.1
 scqubits==3.1.0
-gmsh==4.11.1
+gmsh==4.13.1
 pyaedt==0.6.46
 pyyaml==6.0
 cython<3.0.0
