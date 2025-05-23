@@ -9,7 +9,6 @@ dependencies:
   - geopandas==0.12.2
   - ipython==8.10.0
   - matplotlib==3.7.0
-  - numpy==1.24.2
   - pandas==1.5.3
   - pint==0.20.1
   - pyepr-quantum==0.8.5.7
@@ -17,7 +16,6 @@ dependencies:
   - pyside2==5.15.8
   - qdarkstyle==3.1
   - qutip==4.7.1
-  - scipy==1.10.0
   - shapely==2.0.1
   - jupyter==1.0.0
   - scqubits==3.1.0
@@ -25,5 +23,7 @@ dependencies:
   - pip==23.0
   - cython<3.0.0
   - pip:
+      - numpy==1.24.2
+      - scipy==1.10.0
       - pyaedt==0.6.46
       - gmsh==4.13.1
