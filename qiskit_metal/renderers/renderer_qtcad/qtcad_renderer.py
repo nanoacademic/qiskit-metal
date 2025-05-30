@@ -58,8 +58,8 @@ class QQTCADRenderer(QRendererAnalysis):
             * tol_rel: relative tolerance (see Note). Defaults to 0.05.
             * tol_abs: absolute tolerance (see Note). Defaults to 0.0.
             * min_converged_iters -- How many consecutive iterations are required to give
-                                 results that agree within the tolerance thresholds.
-                                 Default: 3.
+                                     results that agree within the tolerance thresholds.
+                                     Default: 3.
 
             Note:
                 The convergence threshold for each entry of the capacitance
@@ -67,13 +67,43 @@ class QQTCADRenderer(QRendererAnalysis):
                 tol_abs is useful when :math:`|C_{ij}|` is expected to be zero or
                 very small.
 
-        * maxwell_emode -- Dictionary of parameters specific to the Maxwell eigenmode
-                                        extractor.
+        * capacitance_raw -- Dictionary of parameters to be passed directly to QTCAD's capacitance
+                             extractor solver via `qtcad.device.capacitance.SolverParams`.
+                             Overwrites the parameters defined in `capacitance`: _any_ parameters
+                             from `capacitance` are ignored (see note) and the defaults from
+                             `qtcad.device.capacitance.SolverParams` (see its docstring for their
+                             values) take precedence, with the exception of `output_dir`,
+                             `make_subdir` and `name`, which are defined by the parameters of
+                             `QQTCADRenderer`.
 
-            * tol_rel: relative tolerance on the frequency. Defaults to 0.05.
+            Note:
+                For users who want full control of the solver, with the `capacitance` entry in
+                `options` being enough for most applications. The keys should be the parameters
+                accepted by `qtcad.device.capacitance.SolverParams`.
+
+        * maxwell_emode -- Dictionary of parameters specific to the Maxwell eigenmode
+                           extractor.
+
+            * num_modes: Number of modes to solve for. Default: 3.
+            * tol_rel: Relative tolerance on the frequency. Default: 0.05.
             * min_converged_iters -- How many consecutive iterations are required to give
-                                 results that agree within the tolerance thresholds.
-                                 Default: 5.
+                                     results that agree within the tolerance thresholds.
+                                     Default: 5.
+
+        * maxwell_emode_raw -- Dictionary of parameters to be passed directly to QTCAD's Maxwell
+                               eigenmode extractor solver via
+                               `qtcad.device.maxwell_eigenmode.SolverParams`.
+                               Overwrites the parameters defined in `maxwell_emode`: _any_
+                               parameters from `maxwell_emode` are ignored (see note) and the
+                               defaults from `qtcad.device.maxwell_eigenmode.SolverParams` (see
+                               its docstring for their values) take precedence, with the exception
+                               of `output_dir`, `make_subdir` and `name`, which are defined by the
+                               parameters of `QQTCADRenderer`.
+
+            Note:
+                For users who want full control of the solver, with the `maxwell_eigenmode` entry
+                in `options` being enough for most applications. The keys should be the parameters
+                accepted by `qtcad.device.maxwell_eigenmode.SolverParams`.
     """
 
     # The defaults of a renderer must be in a dict named `default_options`. They
@@ -86,7 +116,7 @@ class QQTCADRenderer(QRendererAnalysis):
         output_dir=".",
         geo_filepath="qiskit_device.xao",
         mesh_filepath="qiskit_device.msh4",
-        mesh_scale=1-3,
+        mesh_scale=1e-3,
         materials=default_materials,
         make_subdir=True,
         capacitance=dict(
@@ -94,10 +124,13 @@ class QQTCADRenderer(QRendererAnalysis):
             tol_abs=0.0,
             min_converged_iters=3,
         ),
+        capacitance_raw=None,
         maxwell_emode=dict(
+            num_modes=3,
             tol_rel=0.05,
             min_converged_iters=5,
         ),
+        maxwell_emode_raw=None,
     )
 
     name = "qtcad"
@@ -191,14 +224,6 @@ class QQTCADRenderer(QRendererAnalysis):
 
     def check_environment(self) -> bool:
         """Check if QTCAD is able to fully run as a renderer."""
-
-        # ParaView has a Python API, but usually it is not integrated into
-        # users’ Python environment.
-        self._check_paraview = shutil.which("paraview") is not None
-        if not self._check_paraview:
-            self.logger.warning(
-                "ParaView was not found in the user’s path."
-                " Please install it if you want post-processing visualization.")
 
         return True
 
@@ -613,23 +638,44 @@ class QQTCADRenderer(QRendererAnalysis):
         Path(self.mesh_file).parent.resolve().mkdir(exist_ok=True, parents=True)
         self.gmsh.export_mesh(self.mesh_file, scaling_factor=1)
 
-    def display_post_processing_data(self, signal_conductor: str) -> None:
-        """Post-process the data output by QTCAD in ParaView.
+    def _validate_options(self):
+        if not isinstance(self._options["capacitance_raw"], (type(None), dict)):
+            error_msg = TypeError("`QQTCADRenderer.capacitance_raw` should either be a dictionary"
+                                  " with the parameters allowed by"
+                                  " `qtcad.device.maxwell_eigenmode.SolverParams` or left unset."
+                                  " Please check the `options` parameters used to instantiate the"
+                                  " QTCAD renderer.")
+            self.logger.error(error_msg)
+            raise error_msg
+        if isinstance(self._options["capacitance_raw"], dict):
+            warning_msg = (
+                "In the renderer's `options` argument, `capacitance_raw` was defined."
+                " Any capacitance solver parameters defined using the standard"
+                " `capacitance` key are going to be overwritten by `capacitance_raw` and its"
+                " defaults.")
+            self.logger.warning(warning_msg)
 
-        Args:
-            signal_conductor (str): Signal conductor for post-processing.
-        """
-        if signal_conductor not in self.signal_conductors:
-            self.logger.error(
-                f"No signal conductor “{self.signal_conductors}” found in the model."
-                " The signal conductors defined in this model are:\n"
-                ", ".join([f'"{cond}"' for cond in self.signal_conductors]))
-        else:
-            arguments = ["paraview", self.post_process_files[signal_conductor]]
-            subprocess.call(arguments, cwd=self.output_dir)
+        if not isinstance(self._options["maxwell_emode_raw"], (type(None), dict)):
+            error_msg = TypeError("`QQTCADRenderer.maxwell_emode_raw` should either be a"
+                                  " dictionary with the parameters allowed by"
+                                  " `qtcad.device.maxwell_eigenmode.SolverParams` or left unset."
+                                  " Please check the `options` parameters used to instantiate the"
+                                  " QTCAD renderer.")
+            self.logger.error(error_msg)
+            raise error_msg
+        if isinstance(self._options["maxwell_emode_raw"], dict):
+            warning_msg = (
+                "In the renderer's `options` argument, `maxwell_emode_raw` was defined."
+                " Any Maxwell eigenmode solver parameters defined using the standard"
+                " `maxwell_emode` key are going to be overwritten by `maxwell_emode_raw` and its"
+                " defaults.")
+            self.logger.warning(warning_msg)
 
     def export_parameters(self, json_filepath=None):
         """Exports parameters that are required for QTCAD simulations as a JSON file."""
+
+        # Verify if the simulation parameters are valid.
+        self._validate_options()
 
         if json_filepath is None:
             json_filepath = Path(self._options["output_dir"]) / JSON_FILENAME
@@ -731,8 +777,8 @@ class QQTCADRenderer(QRendererAnalysis):
         self.logger.info("================")
         process = subprocess.Popen(
             [
-                conda_cmd, "run", "-n", env_name, "python", "-u", qtcad_wrapper_path,
-                solve_for, json_filepath
+                conda_cmd, "run", "--no-capture-output", "-n", env_name, "python", "-u",
+                qtcad_wrapper_path, solve_for, json_filepath
             ],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -740,8 +786,7 @@ class QQTCADRenderer(QRendererAnalysis):
             text=True,
         )
 
-        # TODO: Stream the output.
-        # Show the output line by line, avoiding newlines.
+        # Stream the output, showing it line by line and avoiding newlines.
         for line in process.stdout:
             print(line, end="")
 
