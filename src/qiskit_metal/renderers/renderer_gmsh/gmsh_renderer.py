@@ -552,7 +552,6 @@ class QGmshRenderer(QRenderer):
         qc_name = self.design._components[
             path["component"]].name + '_' + clean_name(path["name"])
 
->>>>>>> 8ae0a6ee (Add QTCAD as one of the renderers (QQTCADRenderer)):qiskit_metal/renderers/renderer_gmsh/gmsh_renderer.py
         bad_fillets = bad_fillet_idxs(qc_shapely.coords, qc_fillet)
         curves = render_path_curves(vecs, qc_z, qc_fillet, qc_width, bad_fillets)
         surface = self.make_general_surface(curves)
