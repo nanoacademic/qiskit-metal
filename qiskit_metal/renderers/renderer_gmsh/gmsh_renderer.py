@@ -501,10 +501,10 @@ class QGmshRenderer(QRenderer):
 
         vecs = Vec3DArray.make_vec3DArray(
             self.parse_units_gmsh(list(qc_shapely.coords)), qc_z)
-        
+
         qc_name = self.design._components[
             path["component"]].name + '_' + clean_name(path["name"])
-        
+
         bad_fillets = bad_fillet_idxs(qc_shapely.coords, qc_fillet)
         curves = render_path_curves(vecs, qc_z, qc_fillet, qc_width,
                                     bad_fillets)
