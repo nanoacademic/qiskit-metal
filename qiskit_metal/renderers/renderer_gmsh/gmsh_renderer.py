@@ -1349,10 +1349,10 @@ class QGmshRenderer(QRenderer):
                 "you aren't explicitly handling the mesh size fields, we recommend "
                 "to export the geometry before generating the mesh in your design as "
                 "it might interfere with your .geo_unrolled file imports.")
-        elif has_mesh and file_ext == "brep":
+        elif has_mesh and file_ext == "xao":
             self.logger.warning(
                 "WARNING: The existing model contains mesh size field definitions, "
-                "which are not needed when exporting to BREP files for use in "
+                "which are not needed when exporting to XAO files for use in "
                 "renderers that support adaptive meshing refinement (AMR). If you "
                 "are going to use AMR, consider disabling the use of mesh size "
                 "fields.")
