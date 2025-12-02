@@ -18,21 +18,35 @@ import numpy as np
 import pandas as pd
 import json
 import pickle
+import re
 
+import pyvista as pv
+import shapely
+
+from .qtcad_base import QtcadInputParams, QtcadConstants
 from qiskit_metal import Dict, draw
+from qiskit_metal.toolbox_metal.parsing import parse_entry
 from qiskit_metal.renderers.renderer_base import QRendererAnalysis
 from qiskit_metal.renderers.renderer_gmsh.gmsh_renderer import QGmshRenderer
 from qiskit_metal.designs import MultiPlanar
 
-QISKIT_CAPACITANCE_SCALE = 1e-15
-JSON_FILENAME = "qtcad_data.json"
-QTCAD_CAP_OUTPUT_FILENAME = "qtcad_output_cap.pickle"
-QTCAD_EIG_OUTPUT_FILENAME = "qtcad_output_eigs.pickle"
 
+def sanitize_string(string: str) -> str:
+    """Remove a string’s non-alphanumeric characters/spaces/underscores/hyphens.
+
+    Args:
+        string (str): The input string to be parsed.
+
+    Returns:
+        str: The parsed string.
+    """
+    filename = re.sub(r'[^\w\s\-_.]', '', string)
+    filename = filename.replace(' ', '_')
+    return filename
 
 
 class QQTCADRenderer(QRendererAnalysis):
-    """Extends QRendererAnalysis class to use QTCAD’s API with Gmsh’s meshes.
+    """Extends QRendererAnalysis class to use QTCAD®’s API with Gmsh’s meshes.
     Based on QElmerRenderer.
 
     QQTCADRenderer default options:
@@ -67,7 +81,7 @@ class QQTCADRenderer(QRendererAnalysis):
                 tol_abs is useful when :math:`|C_{ij}|` is expected to be zero or
                 very small.
 
-        * capacitance_raw -- Dictionary of parameters to be passed directly to QTCAD's capacitance
+        * capacitance_raw -- Dictionary of parameters to be passed directly to QTCAD®'s capacitance
                              extractor solver via `qtcad.device.capacitance.SolverParams`.
                              Overwrites the parameters defined in `capacitance`: _any_ parameters
                              from `capacitance` are ignored (see note) and the defaults from
@@ -90,7 +104,7 @@ class QQTCADRenderer(QRendererAnalysis):
                                      results that agree within the tolerance thresholds.
                                      Default: 5.
 
-        * maxwell_emode_raw -- Dictionary of parameters to be passed directly to QTCAD's Maxwell
+        * maxwell_emode_raw -- Dictionary of parameters to be passed directly to QTCAD®'s Maxwell
                                eigenmode extractor solver via
                                `qtcad.device.maxwell_eigenmode.SolverParams`.
                                Overwrites the parameters defined in `maxwell_emode`: _any_
@@ -132,6 +146,13 @@ class QQTCADRenderer(QRendererAnalysis):
         ),
         maxwell_emode_raw=None,
     )
+    default_junction_params = dict(
+        bnd_spec=None,
+        inductance=None,
+        length=None,
+        width=None,
+        dir=None,
+    )
 
     name = "qtcad"
     """name"""
@@ -148,7 +169,7 @@ class QQTCADRenderer(QRendererAnalysis):
             design ('MultiPlanar'): The design.
             layer_types (Union[dict, None]): The type of layer in the format:
               dict(metal=[...], dielectric=[...]). Defaults to `None`.
-            initiate (bool): True to initiate the renderer. Defaults to `False`.
+            initiate (bool): True to initiate the renderer. Defaults to `True`.
             options (Dict, optional): Used to override default options. Defaults
               to `None`.
         """
@@ -159,8 +180,12 @@ class QQTCADRenderer(QRendererAnalysis):
 
         super().__init__(design=design, initiate=initiate, options=options)
 
+        self.geo_file = self._options["geo_filepath"]
         self.mesh_file = None
         self.json_filepath = None
+        self.cap_refined_mesh_file = None
+        self.eig_refined_mesh_file = None
+        self.eig_field_file = None
 
         # If not using adaptive meshing, set adaptive parameters to None.
         # FIXME In the future, it would be desirable to have a flag in the
@@ -174,6 +199,20 @@ class QQTCADRenderer(QRendererAnalysis):
             ]:
                 self._options[arg] = None
 
+        # Initialize the dictionary with QTCAD-specific properties associated
+        # to the tunnelling junctions of each qubit.
+        self.junction_params = dict()
+        for junction in self.design.qgeometry.tables["junction"].iloc:
+            qubit_name = self.design._components[junction.component].name
+            if qubit_name in self.junction_params:
+                error_msg = ValueError(
+                    "Currently, QQTCADRenderer does not support multiple"
+                    " tunnelling junctions per qubit.")
+                self.logger.error(error_msg)
+                raise error_msg
+            self.junction_params[
+                qubit_name] = self.default_junction_params.copy()
+
     @property
     def initialized(self):
         """Check if the renderer is ready to be used.
@@ -184,7 +223,7 @@ class QQTCADRenderer(QRendererAnalysis):
         return status
 
     def initialize_renderer(self):
-        """Initializes the Gmsh and QTCAD renderers.
+        """Initializes the Gmsh and QTCAD® renderers.
 
         NOTE TO THE USER: this should be used when using the QQTCADRenderer
         through design.renderers.qtcad instance.
@@ -204,7 +243,7 @@ class QQTCADRenderer(QRendererAnalysis):
         self._qtcad_ready = self.check_environment()
 
     def _initiate_renderer(self):
-        """Initializes the Gmsh renderer and check QTCAD requirements.
+        """Initializes the Gmsh renderer and check QTCAD® requirements.
 
         NOTE: This is automatically called when the USER specifically imports
         QQTCADRenderer in a Jupyter notebook and instantiates it.
@@ -223,7 +262,7 @@ class QQTCADRenderer(QRendererAnalysis):
         return self._close_renderer()
 
     def check_environment(self) -> bool:
-        """Check if QTCAD is able to fully run as a renderer."""
+        """Check if QTCAD® is able to fully run as a renderer."""
 
         return True
 
@@ -455,6 +494,124 @@ class QQTCADRenderer(QRendererAnalysis):
 
         return netlists
 
+    def _current_direction(
+            self,
+            line: shapely.geometry.linestring.LineString) -> Union[str, None]:
+        """Find the direction to be assumed for an element’s current flow.
+
+        We assume a rectangular tunnelling junction and determine its current
+        flow’s direction based on its geometry.
+
+        Args:
+            line (shapely.geometry.linestring.LineString): The `LineString`
+              that defines a junction component.
+
+        Returns:
+            Union[str, None]: the current flow’s direction: `"x"`, `"y"`, with
+              `None` being returned if the element is not defined along either
+              the x or y directions.
+        """
+        # The two elements of `line.coords.xy` give us the coordinates
+        # (x0, x1) and (y0, y1). When flattened and operated by `np.diff`, we
+        # obtain the vector [x1-x0, y1-y0], which we can compare with unit
+        # vectors to determine its direction.
+        direction_vector = np.diff(line.coords.xy).flatten()
+
+        # Unit vectors.
+        unit_x = np.array([1, 0])
+        unit_y = np.array([0, 1])
+
+        # Compare inner products to distinguish the directions.
+        if np.isclose(direction_vector @ unit_y, 0):
+            direction = "x"
+        elif np.isclose(direction_vector @ unit_x, 0):
+            direction = "y"
+        else:
+            direction = None
+
+        return direction
+
+    def set_up_junction(self, qubit: str, inductance: float,
+                        length: Union[float, int, str]) -> pd.DataFrame:
+        """Define a qubit’s tunnelling junction (inductive port) properties.
+
+        For eigenmode simulations, the tunnelling junction is described as an
+        inductive port with linear inductance. Whilst the width is computed
+        automatically from the qubit geometry, the length needs to be passed
+        manually.
+
+        Note that, for `QQTCADRenderer`, a design’s
+        `qgeometry.tables['junction']` does not fully describe the properties
+        of the QPU’s tunnelling junctions. One also needs to inspect
+        `QQTCADRenderer.junction_params`, which this method updates.
+
+        Args:
+            qubit (str): The name of the qubit whose junction’s properties
+              we will set up.
+            inductance (float): The inductance (in henries) of the Josephson
+              tunnelling junction approximated as a linear inductor.
+            length (Union[float, int, str]): Length of the inductive port
+              describing the junction. It should be the distance between
+              charge islands or the gap between the island and the ground
+              plane.
+
+        Returns:
+            pd.DataFrame: Table with the properties of the junction.
+        """
+
+        if qubit not in self.junction_params:
+            error_msg = KeyError(f"Qubit labelled ‘{qubit}’ not found.")
+            self.logger.error(error_msg)
+            raise error_msg
+
+        # The name of the physical groups associated to tunnelling junctions
+        # in `QGmshRenderer` always follow the same pattern.
+        junction_surface = f"{qubit}_rect_jj"
+
+        # Access the table with the properties of the first tunnelling
+        # junction of the qubit.
+        junction_table = self.design.components[qubit].qgeometry_table(
+            "junction")
+        junction_qgeom = junction_table.iloc[0]
+
+        # Whilst the width is easily accessible from the qubit’s geometry¹,
+        # there is not a single attribute that stores information on the
+        # length of junctions across all transmon-like components. For
+        # instance, for `qiskit_metal.qlibrary.TransmonPocket` it would be
+        # `pad_gap`, whilst for `qiskit_metal.qlibrary.TransmonCross` is
+        # `cross_gap`.
+        # ¹ Concerning the width, some components may have the specific
+        #   property `inductor_width`, whilst other do not.
+        junction_width = parse_entry(junction_qgeom.width)
+        junction_length = parse_entry(length) / self.options["mesh_scale"]
+
+        # Try to determine the direction for the inductive port’s current
+        # flow.
+        junction_direction = self._current_direction(junction_qgeom.geometry)
+        if junction_direction is None:
+            error_msg = ValueError(
+                "Currently, QQTCADRenderer does not support Josephson"
+                " junctions (inductive ports) not aligned along the x- or"
+                " y-axes.")
+            self.logger.error(error_msg)
+            raise error_msg
+
+        self.junction_params[qubit].update(
+            bnd_spec=junction_surface,
+            inductance=inductance,
+            length=junction_length,
+            width=junction_width,
+            dir=junction_direction,
+        )
+
+        # Create a `pandas.DataFrame` to make easier to inspect the parsed
+        # properties of the junction.
+        junction_params_df = pd.DataFrame.from_dict({
+            key: [value] for key, value in self.junction_params[qubit].items()
+        })
+
+        return junction_params_df
+
     def get_gnd_qgeoms(self, open_pins: Union[list, None] = None) -> list[str]:
         """Obtain a list of qgeometry names associated with pins shorted to
         ground.
@@ -613,47 +770,75 @@ class QQTCADRenderer(QRendererAnalysis):
         """Launch Gmsh GUI for viewing the model."""
         self.gmsh.launch_gui()
 
+    def export_geometry(
+        self,
+        geometry_file: Optional[str] = None,
+    ) -> str:
+        """Export the design to a geometry file using Gmsh.
+
+        Args:
+            geometry_file (Optional[str], optional): File path to which to save
+              the geometry file. If `None`, uses the value of the `geo_filepath`
+            entry in QQTCADRenderer’s options dictionary. Default: `None`.
+
+        Returns:
+            str: File path to the exported geometry file.
+        """
+
+        if geometry_file is None:
+            if self._options["geo_filepath"] is not None:
+                self.geo_file = self._options["geo_filepath"]
+        else:
+            self.geo_file = geometry_file
+
+        # Guarantee the path to the mesh file exists.
+        Path(self.geo_file).parent.resolve().mkdir(exist_ok=True, parents=True)
+        self.gmsh.export_geometry(self.geo_file)
+
+        return self.geo_file
+
     def export_mesh(
         self,
         mesh_file: Optional[str] = None,
-        geometry_file: Optional[str] = None,
-    ):
-        """Export the mesh and geometry files.
+    ) -> tuple[str, str | None]:
+        """Export the mesh and, if AMR is enabled, the geometry file.
 
         The mesh is exported with unit scaling factor.
 
         Args:
             mesh_file (Optional[str], optional): File path to which to save the
-              mesh file.
-            geometry_file (Optional[str], optional): File path to which to save
-              the geometry file.
+              mesh file. If `None`, uses the value of the `mesh_filepath`
+              entry in QQTCADRenderer’s options dictionary. Default: `None`.
+
+        Returns:
+            tuple[str, str | None]: If AMR is enabled, 2-tuple with the file
+              path to the exported mesh and geometry files. Otherwise, the
+              second element, associated to the geometry file is `None`.
         """
 
-        if geometry_file is None:
-            geometry_file = self._options["geo_filepath"]
-
-        # We check against `None` once again because
-        # `self._options["geo_filepath"]` is `None` if AMR is not enabled.
-        if geometry_file is not None:
-            Path(geometry_file).parent.resolve().mkdir(exist_ok=True, parents=True)
-            self.gmsh.export_geometry(geometry_file)
+        geo_file = None
+        if self._options["adaptive"]:
+            geo_file = self.export_geometry()
 
         if mesh_file is None:
-            mesh_file = self._options["mesh_filepath"]
-
-        self.mesh_file = mesh_file
+            self.mesh_file = self._options["mesh_filepath"]
+        else:
+            self.mesh_file = mesh_file
 
         # Guarantee the path to the mesh file exists.
         Path(self.mesh_file).parent.resolve().mkdir(exist_ok=True, parents=True)
         self.gmsh.export_mesh(self.mesh_file, scaling_factor=1)
 
+        return self.mesh_file, geo_file
+
     def _validate_options(self):
         if not isinstance(self._options["capacitance_raw"], (type(None), dict)):
-            error_msg = TypeError("`QQTCADRenderer.capacitance_raw` should either be a dictionary"
-                                  " with the parameters allowed by"
-                                  " `qtcad.device.maxwell_eigenmode.SolverParams` or left unset."
-                                  " Please check the `options` parameters used to instantiate the"
-                                  " QTCAD renderer.")
+            error_msg = TypeError(
+                "`QQTCADRenderer.capacitance_raw` should either be a dictionary"
+                " with the parameters allowed by"
+                " `qtcad.device.maxwell_eigenmode.SolverParams` or left unset."
+                " Please check the `options` parameters used to instantiate the"
+                " QTCAD® renderer.")
             self.logger.error(error_msg)
             raise error_msg
         if isinstance(self._options["capacitance_raw"], dict):
@@ -664,12 +849,14 @@ class QQTCADRenderer(QRendererAnalysis):
                 " defaults.")
             self.logger.warning(warning_msg)
 
-        if not isinstance(self._options["maxwell_emode_raw"], (type(None), dict)):
-            error_msg = TypeError("`QQTCADRenderer.maxwell_emode_raw` should either be a"
-                                  " dictionary with the parameters allowed by"
-                                  " `qtcad.device.maxwell_eigenmode.SolverParams` or left unset."
-                                  " Please check the `options` parameters used to instantiate the"
-                                  " QTCAD renderer.")
+        if not isinstance(self._options["maxwell_emode_raw"],
+                          (type(None), dict)):
+            error_msg = TypeError(
+                "`QQTCADRenderer.maxwell_emode_raw` should either be a"
+                " dictionary with the parameters allowed by"
+                " `qtcad.device.maxwell_eigenmode.SolverParams` or left unset."
+                " Please check the `options` parameters used to instantiate the"
+                " QTCAD® renderer.")
             self.logger.error(error_msg)
             raise error_msg
         if isinstance(self._options["maxwell_emode_raw"], dict):
@@ -681,23 +868,28 @@ class QQTCADRenderer(QRendererAnalysis):
             self.logger.warning(warning_msg)
 
     def export_parameters(self, json_filepath=None):
-        """Exports parameters that are required for QTCAD simulations as a JSON file."""
+        """Exports parameters that are required for QTCAD® simulations as a JSON file."""
 
         # Verify if the simulation parameters are valid.
         self._validate_options()
 
         if json_filepath is None:
-            json_filepath = Path(self._options["output_dir"]) / JSON_FILENAME
+            json_filepath = Path(self._options["output_dir"]
+                                ) / QtcadConstants.DEFAULT_JSON_FILENAME
 
         self.json_filepath = json_filepath
 
         data = {
             "gmsh_physical_groups": self.gmsh.physical_groups,
             "_conductors": self.conductors,
+            "_inductive_ports": self.junction_params,
             "sample_holder": self.sample_holder,
             "qtcad_options": {
                 k: v for k, v in self._options.items() if k != "materials"
             },
+            "cap_refined_mesh_file": None,
+            "eig_refined_mesh_file": None,
+            "eig_field_file": None,
         }
 
         # Guarantee the path to the JSON file exists.
@@ -724,20 +916,21 @@ class QQTCADRenderer(QRendererAnalysis):
             return True
         return False
 
-    def run_qtcad(self,
-                  solve_for,
-                  json_filepath=None,
-                  env_name="qtcad",
-                  ):
+    def run_qtcad(
+        self,
+        solve_for,
+        json_filepath=None,
+        env_name="qtcad",
+    ):
         """Calls wrapper file in a specific environment
 
             Args:
-                solve_for (str): Solve for `cap` (capacitance matrix) or `eigs`
+                solve_for (str): Solve for `"cap"` (capacitance matrix) or `"eigs"`
                   (Maxwell eigenmodes).
                 json_filepath (str): Path to the necessary parameters for the solver.
                   Defaults to the value used when exporting them using
                   `export_parameters`.
-                env_name (str): name of the conda environment where QTCAD is available.
+                env_name (str): name of the conda environment where QTCAD® is available.
                   Default: qtcad
 
         """
@@ -750,44 +943,49 @@ class QQTCADRenderer(QRendererAnalysis):
         if json_filepath is None:
             raise Exception(
                 "Unable to find the JSON file with the input parameters to run"
-                " QTCAD simulations."
+                " QTCAD® simulations."
                 " Please make sure to have exported them using"
-                " `export_parameters`."
-                )
+                " `export_parameters`.")
         if not Path(json_filepath).exists():
             raise Exception(
                 "Unable to find the JSON file with the input parameters to run"
-                f" QTCAD simulations at ‘{json_filepath}’."
+                f" QTCAD® simulations at ‘{json_filepath}’."
                 " Please make sure to have exported them using"
                 " `export_parameters`."
                 " If a custom path was provided, make sure it points to a valid"
-                " QTCAD JSON file."
-                )
+                " QTCAD® JSON file.")
 
         if (self.mesh_file is None) or (not Path(self.mesh_file).exists()):
             raise Exception(
                 "Unable to find the mesh file."
-                " Please make sure to have generated it using `export_mesh`."
-                )
+                " Please make sure to have generated it using `export_mesh`.")
+
+        geo_file = self._options["geo_filepath"]
+        adaptive = self._options["adaptive"]
+        if (geo_file
+                is not None) and (not Path(geo_file).exists()) and adaptive:
+            raise Exception(
+                "Unable to find the geometry file."
+                " Please make sure to have generated it using `export_geometry` or"
+                " `export_mesh`.")
 
         qtcad_env_found = self._check_conda_env(env_name)
         if not qtcad_env_found:
             raise Exception(
-                f"Unable to find QTCAD's conda environment ‘{env_name}’."
-                " If you have installed QTCAD in a custom environment, please provide its name"
-                " using the parameter `env_name`."
-                )
+                f"Unable to find QTCAD®'s conda environment ‘{env_name}’."
+                " If you have installed QTCAD® in a custom environment, please provide its name"
+                " using the parameter `env_name`.")
 
         # Launch a subprocess with unbuffered Python (-u).
         conda_cmd = shutil.which("conda")
 
-        self.logger.info("================")
-        self.logger.info("Running QTCAD...")
-        self.logger.info("================")
+        self.logger.info("=================")
+        self.logger.info("Running QTCAD®...")
+        self.logger.info("=================")
         process = subprocess.Popen(
             [
-                conda_cmd, "run", "--no-capture-output", "-n", env_name, "python", "-u",
-                qtcad_wrapper_path, solve_for, json_filepath
+                conda_cmd, "run", "--no-capture-output", "-n", env_name,
+                "python", "-u", qtcad_wrapper_path, solve_for, json_filepath
             ],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -801,12 +999,63 @@ class QQTCADRenderer(QRendererAnalysis):
 
         process.wait()
 
+        # Load additional data from QTCAD’s eigenmode solver.
+        self._load_post_simulation_data(solve_for, json_filepath)
 
-    def load_qtcad_capacitance_matrix(self, filepath: Union[str, None] = None) -> pd.DataFrame:
+    def _load_post_simulation_data(
+        self,
+        solver: str,
+        json_filepath: str | Path,
+    ) -> None:
+        """Load specific post-simulation data from QTCAD®’s solvers.
+
+        QTCAD®’s capacitance and Maxwell eigenmode solvers register additional data
+        associated to electromagnetic field (eigenmode only) and refined mesh
+        (capacitance and eigenmode) files after simulations are run. These data are
+        useful for additional analyses.
+
+        Args:
+            solver (str): Which solver to load the associated post-simulation data.
+                Should be `"cap"` (capacitance matrix) or `"eigs"` (Maxwell eigenmodes).
+            json_filepath (str): Path to JSON file with post-simulation data written by
+                the wrapper around QTCAD®.
+        """
+
+        with open(json_filepath) as f:
+            json_data = json.load(f)
+
+        validated = QtcadInputParams(**json_data)
+        error_msg_template = (
+            "Unable to load post-simulation data from QTCAD®’s"
+            " {solver} solver.")
+        if solver == "eigs":
+            self.eig_refined_mesh_file = validated.eig_refined_mesh_file
+            self.eig_field_file = validated.eig_field_file
+            if None in (self.eig_refined_mesh_file, self.eig_field_file):
+                error_msg = ValueError(
+                    error_msg_template.format(solver="eigenmode"))
+                self.logger.error(error_msg)
+                raise error_msg
+            self.eig_refined_mesh_file = Path(
+                validated.eig_refined_mesh_file).resolve()
+            self.eig_field_file = Path(validated.eig_field_file).resolve()
+        elif solver == "cap":
+            self.cap_refined_mesh_file = validated.cap_refined_mesh_file
+            if self.cap_refined_mesh_file is None:
+                error_msg = ValueError(
+                    error_msg_template.format(solver="capacitance"))
+                self.logger.error(error_msg)
+                raise error_msg
+            self.cap_refined_mesh_file = Path(
+                validated.cap_refined_mesh_file).resolve()
+
+    def load_qtcad_capacitance_matrix(self,
+                                      filepath: Union[str, None] = None
+                                     ) -> pd.DataFrame:
         """Load capacitance matrix from file.
 
         Args:
-            filename (str, optional): Path to the pickle file containing QTCAD's capacitance
+            filename (str, optional): Path to the pickle file containing QTCAD®'s capacitance
             matrix (a dictionary; units: femtofarads). Defaults to `None`, loading the
             default path to the file written by the capacitance extractor.
 
@@ -814,15 +1063,15 @@ class QQTCADRenderer(QRendererAnalysis):
             pd.DataFrame: Table containing the capacitance matrix.
         """
         if filepath is None:
-            filepath = Path(self._options["output_dir"]) / QTCAD_CAP_OUTPUT_FILENAME
+            filepath = Path(self._options["output_dir"]
+                           ) / QtcadConstants.QTCAD_CAP_OUTPUT_FILENAME
 
         input_file = Path(filepath)
         if not input_file.exists():
             raise Exception(
-                f"Unable to load the capacitance matrix generated by QTCAD from ‘{filepath}’."
+                f"Unable to load the capacitance matrix generated by QTCAD® from ‘{filepath}’."
                 " Please make sure the path to the file is correct and the capacitance"
-                " extraction method has ran successfully.",
-                )
+                " extraction method has ran successfully.",)
 
         with open(filepath, 'rb') as handle:
             cap = pickle.load(handle)
@@ -833,9 +1082,13 @@ class QQTCADRenderer(QRendererAnalysis):
         sig_conductor_names = np.array(
             list(dict.fromkeys([k[0] for k in cap.keys()]).keys()))
         sig_conductor_length = len(sig_conductor_names)
-        cap_list = [cap[(i, j)] for i in sig_conductor_names for j in sig_conductor_names]
-        cap_matrix_array = np.reshape(cap_list,
-                                        (sig_conductor_length, sig_conductor_length))
+        cap_list = [
+            cap[(i, j)]
+            for i in sig_conductor_names
+            for j in sig_conductor_names
+        ]
+        cap_matrix_array = np.reshape(
+            cap_list, (sig_conductor_length, sig_conductor_length))
         cap_matrix_df = pd.DataFrame(
             cap_matrix_array,
             index=sig_conductor_names,
@@ -844,11 +1097,13 @@ class QQTCADRenderer(QRendererAnalysis):
 
         return cap_matrix_df
 
-    def load_qtcad_maxwell_eigenmodes(self, filepath: Union[str, None] = None) -> np.ndarray:
+    def load_qtcad_maxwell_eigenmodes(self,
+                                      filepath: Union[str, None] = None
+                                     ) -> np.ndarray:
         """Load Maxwell eigenmodes from file.
 
         Args:
-            filename (str, optional): Path to the pickle file containing QTCAD's Maxwell
+            filename (str, optional): Path to the pickle file containing QTCAD®'s Maxwell
             eigenmode calculation result (units: gigahertz). Defaults to `None`, loading the
             default path to the file written by the Maxwell eigenmode extractor.
 
@@ -856,15 +1111,15 @@ class QQTCADRenderer(QRendererAnalysis):
             nd.ndarray: Ordered list of Maxwell eigenmodes.
         """
         if filepath is None:
-            filepath = Path(self._options["output_dir"]) / QTCAD_EIG_OUTPUT_FILENAME
+            filepath = Path(self._options["output_dir"]
+                           ) / QtcadConstants.QTCAD_EIG_OUTPUT_FILENAME
 
         input_file = Path(filepath)
         if not input_file.exists():
             raise Exception(
-                f"Unable to load Maxwell eigenmodes generated by QTCAD from ‘{filepath}’."
+                f"Unable to load Maxwell eigenmodes generated by QTCAD® from ‘{filepath}’."
                 " Please make sure the path to the file is correct and the eigenmode"
-                " extraction method has ran successfully."
-                )
+                " extraction method has ran successfully.")
 
         with open(filepath, 'rb') as handle:
             eig = pickle.load(handle)
@@ -876,3 +1131,227 @@ class QQTCADRenderer(QRendererAnalysis):
 
         return frequencies / 1e9
 
+    def plot_eigenmodes(
+        self,
+        cmap: str = "magma",
+        log: bool = True,
+        show: bool = True,
+        save: bool = False,
+        vtu_file: str | Path | None = None,
+        num_modes: int | None = None,
+    ) -> Path | None:
+        """Plot a grid with z=0 slices of all the eigenmodes stored in a VTU file.
+
+        PyVista is used to generate the plots of the absolute value of the electric
+        field associated to different Maxwell eigenmodes.
+
+        Args:
+            cmap (str, optional): Name of the colour map to be used. Must be a colour
+                map supported by PyVista. Defaults to `"magma"`.
+            log (bool, optional): Whether to use a logarithmic scale when mapping data
+                to colours. Defaults to `True`.
+            show (bool, optional): Whether to display the plot of the electric fields.
+                Defaults to `True`.
+            save (bool, optional): Whether to save the plot of the electric fields as a
+                PNG file. Defaults to `True`.
+            vtu_file (str | Path | None): Path to a VTU file containing QTCAD®’s
+                electromagnetic fields. If `None`, will automatically consider the VTU
+                file generated by the current `QQTCADRenderer` set up. Must be passed
+                only if loading results from a different simulation set up.
+            num_modes (int | None, optional): The number of modes to plot,
+                starting from the first one. Defaults to `None`, which plots all modes
+                based on the current `QQTCADRenderer` set up. However, if loading a VTU
+                file from a different simulation by passing `vtu_file`, it must be set
+                accordingly.
+
+        Returns:
+            Path | None: Path to the exported image file if `save` was enabled.
+                Otherwise, `None`.
+        """
+
+        if num_modes is None:
+            if self._options.maxwell_emode_raw is None:
+                num_modes = self._options.maxwell_emode["num_modes"]
+            else:
+                num_modes = self._options.maxwell_emode_raw["num_modes"]
+
+        if vtu_file is None:
+            input_file_path = Path(self.eig_field_file)
+        else:
+            input_file_path = Path(vtu_file)
+        output_file = None
+
+        # Selectively load the relevant arrays from the VTU file.
+        reader = pv.get_reader(input_file_path)
+        # Disable all arrays.
+        reader.disable_all_point_arrays()
+        reader.disable_all_cell_arrays()
+        # Enable the eigenmode-specific arrays and ingest the file.
+        # TODO: Verify if the VTU file has all the layers.
+        for mdx in range(num_modes):
+            reader.enable_point_array(
+                QtcadConstants.EIGENMODE_LAYER_TEMPLATE.format(n=mdx))
+        mesh = reader.read()
+
+        # Maximum number of axes along the horizontal direction.
+        num_axes_h = 2
+        # Wrap the list with the indices to the eigenmodes and get the
+        # resulting list’s length. This is the desired number of axes along
+        # the vertical direction.
+        modes_wrapped = [
+            list(range(num_modes))[i:i + num_axes_h]
+            for i in range(0, num_modes, num_axes_h)
+        ]
+        num_axes_v = len(modes_wrapped)
+
+        # Set up the plot.
+        window_size = (500 * num_axes_h, 500 * num_axes_v)
+        plotter = pv.Plotter(shape=(num_axes_v, num_axes_h),
+                             window_size=window_size)
+        for vdx in range(num_axes_v):
+            for hdx in range(len(modes_wrapped[vdx])):
+                mdx = modes_wrapped[vdx][hdx]
+                scalar_layer = QtcadConstants.EIGENMODE_LAYER_TEMPLATE.format(
+                    n=mdx)
+                title = f"Eigenmode {mdx+1}"
+
+                # Create slice at z=0.
+                sliced_data = mesh.slice(normal='z', origin=(0, 0, 0))
+
+                plotter.subplot(vdx, hdx)
+                # Add the sliced data.
+                plotter.add_mesh(
+                    sliced_data,
+                    scalars=scalar_layer,
+                    log_scale=log,
+                    cmap=cmap,
+                    # Disable the scalar bar to add a customized one later.
+                    show_scalar_bar=False,
+                )
+                plotter.add_title(title, font_size=11)
+                # Add a custom scalar bar.
+                plotter.add_scalar_bar(
+                    title=f"|E| (V/m), mode {mdx+1}",
+                    position_x=0.15,
+                    position_y=0.05,
+                    width=0.7,
+                    height=0.1,
+                    label_font_size=10,
+                )
+                # Make sure the x-y plane is visible.
+                plotter.view_xy()
+
+        if show:
+            plotter.show()
+        if save:
+            output_file = input_file_path.with_suffix(".png").resolve()
+            plotter.screenshot(
+                output_file.resolve(),
+                transparent_background=False,
+            )
+            print(f"Image saved to ‘{output_file.resolve()}’.")
+
+        del mesh
+
+        return output_file
+
+    def plot_eigenmode(
+        self,
+        n: int = 1,
+        cmap: str = "magma",
+        log: bool = True,
+        show: bool = True,
+        save: bool = False,
+        vtu_file: str | Path | None = None,
+    ) -> Path | None:
+        """Plot the z=0 slice of a given eigenmode stored in a VTU file.
+
+        PyVista is used to generate the plot of the absolute value of the electric
+        field associated to the desired Maxwell eigenmode.
+
+        Args:
+            n (int): Index of the desired eigenmode. Indexing starts from 1, the ground
+                state.
+            cmap (str, optional): Name of the colour map to be used. Must be a colour
+                map supported by PyVista. Defaults to `"magma"`.
+            log (bool, optional): Whether to use a logarithmic scale when mapping data
+                to colours. Defaults to `True`.
+            show (bool, optional): Whether to display the plot of the electric field.
+                Defaults to `True`.
+            save (bool, optional): Whether to save the plot of the electric field as a
+                PNG file. Defaults to `True`.
+            vtu_file (str | Path | None): Path to a VTU file containing QTCAD®’s
+                electromagnetic fields. If `None`, will automatically consider the VTU
+                file generated by the current `QQTCADRenderer` set up. Must be passed
+                only if loading results from a different simulation set up.
+
+        Returns:
+            Union[str, None]: `str` with the path to the exported image file if `save`
+                was enabled. Otherwise, `None`.
+        """
+
+        if vtu_file is None:
+            input_file_path = Path(self.eig_field_file)
+        else:
+            input_file_path = Path(vtu_file)
+        output_file = None
+        title = f"Eigenmode {n}"
+        window_size = (1000, 1000)
+
+        # Selectively load the relevant arrays from the VTU file.
+        reader = pv.get_reader(input_file_path)
+        # Disable all arrays.
+        reader.disable_all_point_arrays()
+        reader.disable_all_cell_arrays()
+        # Enable the specific eigenmode array and ingest the file.
+        mdx = n - 1
+        scalar_layer = QtcadConstants.EIGENMODE_LAYER_TEMPLATE.format(n=mdx)
+        reader.enable_point_array(scalar_layer)
+        mesh = reader.read()
+
+        # Create slice at z=0.
+        sliced_data = mesh.slice(normal='z', origin=(0, 0, 0))
+
+        # Set up the plot.
+        plotter = pv.Plotter(window_size=window_size)
+        # Add the sliced data.
+        plotter.add_mesh(
+            sliced_data,
+            scalars=scalar_layer,
+            log_scale=log,
+            cmap=cmap,
+            # Disable the scalar bar to add a customized one later.
+            show_scalar_bar=False,
+        )
+        plotter.add_title(title, font_size=11)
+        # Add a custom scalar bar.
+        plotter.add_scalar_bar(
+            title=f"|E| (V/m), mode {mdx+1}",
+            position_x=0.15,
+            position_y=0.05,
+            width=0.7,
+            height=0.1,
+            label_font_size=10,
+        )
+        # Make sure the x-y plane is visible.
+        plotter.view_xy()
+
+        if show:
+            plotter.show()
+        if save:
+            sanitized_layer_name = sanitize_string(
+                QtcadConstants.EIGENMODE_LAYER_TEMPLATE.format(n=mdx + 1))
+            output_file = input_file_path.with_name(
+                f"{input_file_path.stem}-{sanitized_layer_name}.png").resolve()
+            plotter.screenshot(
+                output_file.resolve(),
+                window_size=window_size,
+                transparent_background=False,
+            )
+            print(
+                f"Image of the eigenmode {n} saved to ‘{output_file.resolve()}’."
+            )
+
+        del mesh
+
+        return output_file

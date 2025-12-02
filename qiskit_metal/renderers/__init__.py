@@ -82,6 +82,16 @@ GMSH Renderer
     Vec3DArray
 
 
+QTCAD Renderer
+--------------
+
+.. autosummary::
+    :toctree: ../stubs/
+
+    QQTCADRenderer
+    QtcadConstants
+
+
 
 """
 
@@ -112,6 +122,9 @@ if config.is_building_docs():
 
     from .renderer_gmsh.gmsh_utils import Vec3DArray
     from .renderer_gmsh.gmsh_renderer import QGmshRenderer
+
+    from .renderer_qtcad.qtcad_renderer import QQTCADRenderer
+    from .renderer_qtcad.qtcad_base import QtcadConstants
 
     from .renderer_ansys_pyaedt.pyaedt_base import QPyaedt
     from .renderer_ansys_pyaedt.q3d_renderer_aedt import QQ3DPyaedt

@@ -5,10 +5,12 @@ import numpy as np
 import sys
 import logging
 import pickle
+from copy import deepcopy
 
 logging.basicConfig()
 logger = logging.getLogger("qtcad")
 
+from qtcad_base import QtcadInputParams, QtcadConstants
 from qtcad.device import Device as qtcad_device
 from qtcad.device.mesh3d import Mesh as qtcad_mesh
 from qtcad.device import materials as qtcad_materials
@@ -17,56 +19,76 @@ from qtcad.device.capacitance import SolverParams as QtcadSolverCapParams
 from qtcad.device.maxwell_eigenmode import Solver as QtcadSolverEig
 from qtcad.device.maxwell_eigenmode import SolverParams as QtcadSolverEigParams
 
-from dataclasses import dataclass
-
-QISKIT_CAPACITANCE_SCALE = 1e-15
-
-QTCAD_CAP_OUTPUT_FILENAME = "qtcad_output_cap.pickle"
-QTCAD_EIG_OUTPUT_FILENAME = "qtcad_output_eigs.pickle"
-
-@dataclass
-class QTCADInputParams:
-
-    gmsh_physical_groups: dict
-    _conductors: dict
-    sample_holder: bool
-    qtcad_options: dict
-
 
 class QQTCADWrapper():
 
     name = "qtcad"
 
-    def __init__(self, json_data=None):
+    def __init__(self, json_file: None | str | Path = None) -> None:
         """
         Args:
-            json_data : Parameters imported from QQTCADRenderer.
+            json_file (None|str|Path) : File path to the JSON file with the parameters
+            from `QQTCADRenderer`. If `None`, will use its default value
+            `"qtcad_data.json"`.
         """
 
-        if json_data is None:
-            json_data = "qtcad_data.json"
+        if json_file is None:
+            json_file = QtcadConstants.DEFAULT_JSON_FILENAME
 
-        self.json_data = json_data
+        self.json_file = json_file
+        self.json_data = None
         self.gmsh_physical_groups = None
         self._conductors = None
+        self._inductive_ports = None
         self.sample_holder = None
         self.qtcad_options = None
 
     def load_and_validate(self):
 
-        with open(self.json_data) as f:
-            data = json.load(f)
+        with open(self.json_file) as f:
+            self.json_data = json.load(f)
 
-        validated = QTCADInputParams(**data)
+        # Work with a copy, as we need the original serializable data.
+        validated = QtcadInputParams(**deepcopy(self.json_data))
         self.gmsh_physical_groups = validated.gmsh_physical_groups
         self._conductors = validated._conductors
+        self._inductive_ports = validated._inductive_ports
         self.sample_holder = validated.sample_holder
         self._options = validated.qtcad_options
 
         self._options["materials"] = dict(substrate=qtcad_materials.Si,)
 
+    def update_json(self, solver_data: dict) -> None:
+        """Update already-existing entries of the original input JSON data file.
+
+        Args:
+            solver_data (dict): Dictionary with the entries to be updated. It must be
+                serializable.
+        """
+
+        # Check if the keys to be updated are a valid subset of the possible fields.
+        if not solver_data.keys() <= self.json_data.keys():
+            error_msg = ValueError(
+                "Invalid (superfluous) data found when trying to update JSON data."
+            )
+            logger.error(error_msg)
+            raise error_msg
+
+        # Check if the data-to-be-updated is serializable.
+        try:
+            _ = json.dumps(solver_data)
+        except (TypeError, OverflowError):
+            error_msg = ValueError("Invalid (non-serializable) input data.")
+            logger.error(error_msg)
+            raise error_msg
+
+        self.json_data.update(solver_data)
+
+        with open(self.json_file, "w") as f:
+            json.dump(self.json_data, f, indent=2)
+
     def setup(self, bnd_conditions) -> None:
-        """Set up QTCAD.
+        """Set up QTCAD®.
 
         Args:
             bnd_conditions : Boundary conditions assigned on conductors.
@@ -147,6 +169,7 @@ class QQTCADWrapper():
         self.signal_conductors = dict()
         ground_conductor = []
         self.conductors = []
+        self.inductive_ports = []
 
         for layer, ph_geoms in self.gmsh_physical_groups.items():
             # ph_geoms: set of (label, Gmsh physical group ID)
@@ -165,12 +188,13 @@ class QQTCADWrapper():
             if conductor == "gnd":
                 ground_conductor += signal_conductor_surfaces
             else:
-                self.signal_conductors[geom_names[-1]] = signal_conductor_surfaces
+                self.signal_conductors[
+                    geom_names[-1]] = signal_conductor_surfaces
 
         if len(self.signal_conductors.keys()) == 0:
             logger.warning(
                 "WARNING: No conductors were assigned to a signal conductor."
-                " QTCAD will not be able to extract the capacitance matrix for"
+                " QTCAD® will not be able to extract the capacitance matrix for"
                 " this design.")
 
         # Qiskit Metal assumes the presence of the ground(_plane) conductor in
@@ -191,19 +215,31 @@ class QQTCADWrapper():
             for boundary in self.conductors:
                 self.device.new_pec_bnd(boundary)
 
+        # Set boundary conditions for the inductive ports (tunnelling
+        # junctions). The port parameters are fully specified by the
+        # dictionaries created by `QQTCADRenderer.set_up_junction`.
+        for qubit_name, junction_params in self._inductive_ports.items():
+            # Ignore junctions that were not set up.
+            if junction_params["bnd_spec"] is None:
+                continue
+            self.device.new_inductor(**junction_params)
+
         # FIXME Whilst we do not have a way of setting infinity boundary
         # conditions, let us not touch on `vacuum_box_sfs`, which then implies
         # it is a natural boundary
         # self.device.new_infinity_bnd("vacuum_box_sfs")
 
     def solve_eigs(self):
-        """Solve for Maxwell eigenmodes using QTCAD.
+        """Solve for Maxwell eigenmodes using QTCAD®.
 
         Returns:
             The frequencies are stored in `device.maxwell_freqs`. The fields are
             also stored in `device` and can be retrieved by calling the
             corresponding field finding methods such as `device.e_field`.
         """
+
+        refined_mesh_file = None
+        field_file = None
 
         # Instantiate SolverParams and load common attributes from the `_options`
         # attribute.
@@ -215,7 +251,8 @@ class QQTCADWrapper():
             # Reduced set of parameters.
             solver_params_eig.num_modes = options_maxwell_emode["num_modes"]
             solver_params_eig.tol_rel = options_maxwell_emode["tol_rel"]
-            solver_params_eig.min_converged_iters = options_maxwell_emode["min_converged_iters"]
+            solver_params_eig.min_converged_iters = options_maxwell_emode[
+                "min_converged_iters"]
         else:
             # Pass parameters directly to `qtcad.device.maxwell_eigenmode.SolverParams`.
             solver_params_eig = QtcadSolverEigParams(options_maxwell_emode_raw)
@@ -228,12 +265,22 @@ class QQTCADWrapper():
         # Parse parameters.
         self.solver_params_eig = solver_params_eig
         qtcad_solver_eigs = QtcadSolverEig(
-            self.device, self.solver_params_eig, geo_file=self._options["geo_filepath"]
-        )
+            self.device,
+            self.solver_params_eig,
+            geo_file=self._options["geo_filepath"])
         self.solver_eig = qtcad_solver_eigs
 
         # Solve.
         qtcad_solver_eigs.solve()
+
+        # Update JSON data from post-simulation solver attributes.
+        if len(qtcad_solver_eigs.refined_mesh_files) > 0:
+            refined_mesh_file = qtcad_solver_eigs.refined_mesh_files[-1]
+        if ".vtu" in str(qtcad_solver_eigs.field_files[-1][0]):
+            field_file = qtcad_solver_eigs.field_files[-1][0]
+        solver_data = dict(eig_refined_mesh_file=str(refined_mesh_file),
+                           eig_field_file=str(field_file))
+        self.update_json(solver_data)
 
     def get_energy_e(self):
         """Finds the total electric energy in the device from the electric field.
@@ -317,7 +364,7 @@ class QQTCADWrapper():
                          " Try calling `solve_eigs` before.")
 
     def solve_cap(self):
-        """Compute the capacitance matrix using QTCAD.
+        """Compute the capacitance matrix using QTCAD®.
 
         It is stored in the attribute `capacitance_matrix`, being a
         dict[tuple[str,str], float].
@@ -332,7 +379,8 @@ class QQTCADWrapper():
             # Reduced set of parameters.
             solver_params_cap.tol_rel = options_cap["tol_rel"]
             solver_params_cap.tol_abs = options_cap["tol_abs"]
-            solver_params_cap.min_converged_iters = options_cap["min_converged_iters"]
+            solver_params_cap.min_converged_iters = options_cap[
+                "min_converged_iters"]
         else:
             # Pass parameters directly to `qtcad.device.capacitance.SolverParams`.
             solver_params_cap = QtcadSolverCapParams(options_cap_raw)
@@ -344,7 +392,7 @@ class QQTCADWrapper():
 
         self.solver_params_cap = solver_params_cap
 
-        logger.info("Running QTCAD capacitance extraction.")
+        logger.info("Running QTCAD® capacitance extraction.")
         self.capacitance_matrix = self.compute_capacitance_matrix()
 
     def save_capacitance_matrix(self, path: str) -> None:
@@ -361,9 +409,13 @@ class QQTCADWrapper():
         sig_conductor_length = len(sig_conductor_names)
 
         # Create ordered capacitance matrix.
-        cap_list = [cap[(i, j)] for i in sig_conductor_names for j in sig_conductor_names]
-        cap_matrix_array = np.reshape(cap_list,
-                                      (sig_conductor_length, sig_conductor_length))
+        cap_list = [
+            cap[(i, j)]
+            for i in sig_conductor_names
+            for j in sig_conductor_names
+        ]
+        cap_matrix_array = np.reshape(
+            cap_list, (sig_conductor_length, sig_conductor_length))
         return cap_matrix_array
 
     def compute_capacitance_matrix(self) -> dict[tuple[str, str], float]:
@@ -373,16 +425,23 @@ class QQTCADWrapper():
              dict: Capacitance matrix in femtofarads between the conductors.
         """
 
-        qtcad_solver = QtcadSolverCap(
-            self.device, self.signal_conductors, self.solver_params_cap, geo_file=self._options["geo_filepath"]
-        )
+        qtcad_solver = QtcadSolverCap(self.device,
+                                      self.signal_conductors,
+                                      self.solver_params_cap,
+                                      geo_file=self._options["geo_filepath"])
 
         # dict[tuple[str,str], float]
         cap_out = qtcad_solver.solve()
 
+        # Update JSON data from post-simulation solver attributes.
+        if len(qtcad_solver.refined_mesh_files) > 0:
+            refined_mesh_file = qtcad_solver.refined_mesh_files[-1]
+        solver_data = dict(cap_refined_mesh_file=str(refined_mesh_file))
+        self.update_json(solver_data)
+
         for cap in cap_out.keys():
             # Scale capacitance to femtofarads.
-            cap_out[cap] /= QISKIT_CAPACITANCE_SCALE
+            cap_out[cap] /= QtcadConstants.QISKIT_CAPACITANCE_SCALE
             # Convert np.float64 to float to avoid issues with pickle files.
             # See https://github.com/numpy/numpy/issues/24844
             # FIXME: When Qiskit Metal updates to Numpy >2, this can be removed.
@@ -391,15 +450,16 @@ class QQTCADWrapper():
         return cap_out
 
 
-def main_solve_cap(json_data):
+def main_solve_cap(json_file):
 
-    qtcad_wrapper = QQTCADWrapper(json_data=json_data)
+    qtcad_wrapper = QQTCADWrapper(json_file=json_file)
     qtcad_wrapper.load_and_validate()
     qtcad_wrapper.setup("Dirichlet")
 
     qtcad_wrapper.solve_cap()
-    # Save results as a pickle file to be ingested by the QQTCADRenderer.
-    filepath = Path(qtcad_wrapper._options["output_dir"]) / QTCAD_CAP_OUTPUT_FILENAME
+    # Save results as a pickle file to be ingested by `QQTCADRenderer`.
+    filepath = Path(qtcad_wrapper._options["output_dir"]
+                   ) / QtcadConstants.QTCAD_CAP_OUTPUT_FILENAME
     filepath.parent.resolve().mkdir(exist_ok=True, parents=True)
     with open(filepath, 'wb') as file_handle:
         pickle.dump(qtcad_wrapper.capacitance_matrix,
@@ -407,16 +467,18 @@ def main_solve_cap(json_data):
                     protocol=pickle.HIGHEST_PROTOCOL)
 
 
-def main_solve_eigs(json_data):
+def main_solve_eigs(json_file):
 
-    qtcad_wrapper = QQTCADWrapper(json_data=json_data)
+    qtcad_wrapper = QQTCADWrapper(json_file=json_file)
     qtcad_wrapper.load_and_validate()
     qtcad_wrapper.setup("PEC")
 
     qtcad_wrapper.solve_eigs()
 
-    Path(qtcad_wrapper._options["output_dir"]).resolve().mkdir(exist_ok=True, parents=True)
-    filepath = Path(qtcad_wrapper._options["output_dir"]) / QTCAD_EIG_OUTPUT_FILENAME
+    Path(qtcad_wrapper._options["output_dir"]).resolve().mkdir(exist_ok=True,
+                                                               parents=True)
+    filepath = Path(qtcad_wrapper._options["output_dir"]
+                   ) / QtcadConstants.QTCAD_EIG_OUTPUT_FILENAME
 
     with open(filepath, 'wb') as file_handle:
         pickle.dump(qtcad_wrapper.device.maxwell_freqs.tolist(),
@@ -426,16 +488,17 @@ def main_solve_eigs(json_data):
 
 if __name__ == "__main__":
     if len(sys.argv) < 3:
-        print("Usage: python wrapper.py quantity-to-solve-for path-to-json-file")
+        print(
+            "Usage: python wrapper.py quantity-to-solve-for path-to-json-file")
         sys.exit(1)
 
     solve_for = sys.argv[1]
-    json_data = sys.argv[2]
+    json_file = sys.argv[2]
 
     if solve_for == "cap":
-        main_solve_cap(json_data)
+        main_solve_cap(json_file)
     elif solve_for == "eigs":
-        main_solve_eigs(json_data)
+        main_solve_eigs(json_file)
     else:
         print(f"Wrong quantity to solve for: {solve_for}."
               " Use `cap` for capacitance or `eigs` for Maxwell eigenvalues.")
