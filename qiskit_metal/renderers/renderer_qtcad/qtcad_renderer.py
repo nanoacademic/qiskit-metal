@@ -147,11 +147,11 @@ class QQTCADRenderer(QRendererAnalysis):
         maxwell_emode_raw=None,
     )
     default_junction_params = dict(
-        bnd_spec = None,
-        inductance = None,
-        length = None,
-        width = None,
-        dir = None,
+        bnd_spec=None,
+        inductance=None,
+        length=None,
+        width=None,
+        dir=None,
     )
 
     name = "qtcad"
@@ -180,6 +180,7 @@ class QQTCADRenderer(QRendererAnalysis):
 
         super().__init__(design=design, initiate=initiate, options=options)
 
+        self.geo_file = self._options["geo_filepath"]
         self.mesh_file = None
         self.json_filepath = None
         self.cap_refined_mesh_file = None
@@ -769,47 +770,75 @@ class QQTCADRenderer(QRendererAnalysis):
         """Launch Gmsh GUI for viewing the model."""
         self.gmsh.launch_gui()
 
+    def export_geometry(
+        self,
+        geometry_file: Optional[str] = None,
+    ) -> str:
+        """Export the design to a geometry file using Gmsh.
+
+        Args:
+            geometry_file (Optional[str], optional): File path to which to save
+              the geometry file. If `None`, uses the value of the `geo_filepath`
+            entry in QQTCADRenderer’s options dictionary. Default: `None`.
+
+        Returns:
+            str: File path to the exported geometry file.
+        """
+
+        if geometry_file is None:
+            if self._options["geo_filepath"] is not None:
+                self.geo_file = self._options["geo_filepath"]
+        else:
+            self.geo_file = geometry_file
+
+        # Guarantee the path to the mesh file exists.
+        Path(self.geo_file).parent.resolve().mkdir(exist_ok=True, parents=True)
+        self.gmsh.export_geometry(self.geo_file)
+
+        return self.geo_file
+
     def export_mesh(
         self,
         mesh_file: Optional[str] = None,
-        geometry_file: Optional[str] = None,
-    ):
-        """Export the mesh and geometry files.
+    ) -> tuple[str, str | None]:
+        """Export the mesh and, if AMR is enabled, the geometry file.
 
         The mesh is exported with unit scaling factor.
 
         Args:
             mesh_file (Optional[str], optional): File path to which to save the
-              mesh file.
-            geometry_file (Optional[str], optional): File path to which to save
-              the geometry file.
+              mesh file. If `None`, uses the value of the `mesh_filepath`
+              entry in QQTCADRenderer’s options dictionary. Default: `None`.
+
+        Returns:
+            tuple[str, str | None]: If AMR is enabled, 2-tuple with the file
+              path to the exported mesh and geometry files. Otherwise, the
+              second element, associated to the geometry file is `None`.
         """
 
-        if geometry_file is None:
-            geometry_file = self._options["geo_filepath"]
-
-        # We check against `None` once again because
-        # `self._options["geo_filepath"]` is `None` if AMR is not enabled.
-        if geometry_file is not None:
-            Path(geometry_file).parent.resolve().mkdir(exist_ok=True, parents=True)
-            self.gmsh.export_geometry(geometry_file)
+        geo_file = None
+        if self._options["adaptive"]:
+            geo_file = self.export_geometry()
 
         if mesh_file is None:
-            mesh_file = self._options["mesh_filepath"]
-
-        self.mesh_file = mesh_file
+            self.mesh_file = self._options["mesh_filepath"]
+        else:
+            self.mesh_file = mesh_file
 
         # Guarantee the path to the mesh file exists.
         Path(self.mesh_file).parent.resolve().mkdir(exist_ok=True, parents=True)
         self.gmsh.export_mesh(self.mesh_file, scaling_factor=1)
 
+        return self.mesh_file, geo_file
+
     def _validate_options(self):
         if not isinstance(self._options["capacitance_raw"], (type(None), dict)):
-            error_msg = TypeError("`QQTCADRenderer.capacitance_raw` should either be a dictionary"
-                                  " with the parameters allowed by"
-                                  " `qtcad.device.maxwell_eigenmode.SolverParams` or left unset."
-                                  " Please check the `options` parameters used to instantiate the"
-                                  " QTCAD® renderer.")
+            error_msg = TypeError(
+                "`QQTCADRenderer.capacitance_raw` should either be a dictionary"
+                " with the parameters allowed by"
+                " `qtcad.device.maxwell_eigenmode.SolverParams` or left unset."
+                " Please check the `options` parameters used to instantiate the"
+                " QTCAD® renderer.")
             self.logger.error(error_msg)
             raise error_msg
         if isinstance(self._options["capacitance_raw"], dict):
@@ -820,12 +849,14 @@ class QQTCADRenderer(QRendererAnalysis):
                 " defaults.")
             self.logger.warning(warning_msg)
 
-        if not isinstance(self._options["maxwell_emode_raw"], (type(None), dict)):
-            error_msg = TypeError("`QQTCADRenderer.maxwell_emode_raw` should either be a"
-                                  " dictionary with the parameters allowed by"
-                                  " `qtcad.device.maxwell_eigenmode.SolverParams` or left unset."
-                                  " Please check the `options` parameters used to instantiate the"
-                                  " QTCAD® renderer.")
+        if not isinstance(self._options["maxwell_emode_raw"],
+                          (type(None), dict)):
+            error_msg = TypeError(
+                "`QQTCADRenderer.maxwell_emode_raw` should either be a"
+                " dictionary with the parameters allowed by"
+                " `qtcad.device.maxwell_eigenmode.SolverParams` or left unset."
+                " Please check the `options` parameters used to instantiate the"
+                " QTCAD® renderer.")
             self.logger.error(error_msg)
             raise error_msg
         if isinstance(self._options["maxwell_emode_raw"], dict):
@@ -885,11 +916,12 @@ class QQTCADRenderer(QRendererAnalysis):
             return True
         return False
 
-    def run_qtcad(self,
-                  solve_for,
-                  json_filepath=None,
-                  env_name="qtcad",
-                  ):
+    def run_qtcad(
+        self,
+        solve_for,
+        json_filepath=None,
+        env_name="qtcad",
+    ):
         """Calls wrapper file in a specific environment
 
             Args:
@@ -913,8 +945,7 @@ class QQTCADRenderer(QRendererAnalysis):
                 "Unable to find the JSON file with the input parameters to run"
                 " QTCAD® simulations."
                 " Please make sure to have exported them using"
-                " `export_parameters`."
-                )
+                " `export_parameters`.")
         if not Path(json_filepath).exists():
             raise Exception(
                 "Unable to find the JSON file with the input parameters to run"
@@ -922,33 +953,39 @@ class QQTCADRenderer(QRendererAnalysis):
                 " Please make sure to have exported them using"
                 " `export_parameters`."
                 " If a custom path was provided, make sure it points to a valid"
-                " QTCAD® JSON file."
-                )
+                " QTCAD® JSON file.")
 
         if (self.mesh_file is None) or (not Path(self.mesh_file).exists()):
             raise Exception(
                 "Unable to find the mesh file."
-                " Please make sure to have generated it using `export_mesh`."
-                )
+                " Please make sure to have generated it using `export_mesh`.")
+
+        geo_file = self._options["geo_filepath"]
+        adaptive = self._options["adaptive"]
+        if (geo_file
+                is not None) and (not Path(geo_file).exists()) and adaptive:
+            raise Exception(
+                "Unable to find the geometry file."
+                " Please make sure to have generated it using `export_geometry` or"
+                " `export_mesh`.")
 
         qtcad_env_found = self._check_conda_env(env_name)
         if not qtcad_env_found:
             raise Exception(
                 f"Unable to find QTCAD®'s conda environment ‘{env_name}’."
                 " If you have installed QTCAD® in a custom environment, please provide its name"
-                " using the parameter `env_name`."
-                )
+                " using the parameter `env_name`.")
 
         # Launch a subprocess with unbuffered Python (-u).
         conda_cmd = shutil.which("conda")
 
-        self.logger.info("================")
+        self.logger.info("=================")
         self.logger.info("Running QTCAD®...")
-        self.logger.info("================")
+        self.logger.info("=================")
         process = subprocess.Popen(
             [
-                conda_cmd, "run", "--no-capture-output", "-n", env_name, "python", "-u",
-                qtcad_wrapper_path, solve_for, json_filepath
+                conda_cmd, "run", "--no-capture-output", "-n", env_name,
+                "python", "-u", qtcad_wrapper_path, solve_for, json_filepath
             ],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -988,8 +1025,9 @@ class QQTCADRenderer(QRendererAnalysis):
             json_data = json.load(f)
 
         validated = QtcadInputParams(**json_data)
-        error_msg_template = ("Unable to load post-simulation data from QTCAD®’s"
-                              " {solver} solver.")
+        error_msg_template = (
+            "Unable to load post-simulation data from QTCAD®’s"
+            " {solver} solver.")
         if solver == "eigs":
             self.eig_refined_mesh_file = validated.eig_refined_mesh_file
             self.eig_field_file = validated.eig_field_file
@@ -1011,7 +1049,9 @@ class QQTCADRenderer(QRendererAnalysis):
             self.cap_refined_mesh_file = Path(
                 validated.cap_refined_mesh_file).resolve()
 
-    def load_qtcad_capacitance_matrix(self, filepath: Union[str, None] = None) -> pd.DataFrame:
+    def load_qtcad_capacitance_matrix(self,
+                                      filepath: Union[str, None] = None
+                                     ) -> pd.DataFrame:
         """Load capacitance matrix from file.
 
         Args:
@@ -1031,8 +1071,7 @@ class QQTCADRenderer(QRendererAnalysis):
             raise Exception(
                 f"Unable to load the capacitance matrix generated by QTCAD® from ‘{filepath}’."
                 " Please make sure the path to the file is correct and the capacitance"
-                " extraction method has ran successfully.",
-                )
+                " extraction method has ran successfully.",)
 
         with open(filepath, 'rb') as handle:
             cap = pickle.load(handle)
@@ -1043,9 +1082,13 @@ class QQTCADRenderer(QRendererAnalysis):
         sig_conductor_names = np.array(
             list(dict.fromkeys([k[0] for k in cap.keys()]).keys()))
         sig_conductor_length = len(sig_conductor_names)
-        cap_list = [cap[(i, j)] for i in sig_conductor_names for j in sig_conductor_names]
-        cap_matrix_array = np.reshape(cap_list,
-                                        (sig_conductor_length, sig_conductor_length))
+        cap_list = [
+            cap[(i, j)]
+            for i in sig_conductor_names
+            for j in sig_conductor_names
+        ]
+        cap_matrix_array = np.reshape(
+            cap_list, (sig_conductor_length, sig_conductor_length))
         cap_matrix_df = pd.DataFrame(
             cap_matrix_array,
             index=sig_conductor_names,
@@ -1054,7 +1097,9 @@ class QQTCADRenderer(QRendererAnalysis):
 
         return cap_matrix_df
 
-    def load_qtcad_maxwell_eigenmodes(self, filepath: Union[str, None] = None) -> np.ndarray:
+    def load_qtcad_maxwell_eigenmodes(self,
+                                      filepath: Union[str, None] = None
+                                     ) -> np.ndarray:
         """Load Maxwell eigenmodes from file.
 
         Args:
@@ -1074,8 +1119,7 @@ class QQTCADRenderer(QRendererAnalysis):
             raise Exception(
                 f"Unable to load Maxwell eigenmodes generated by QTCAD® from ‘{filepath}’."
                 " Please make sure the path to the file is correct and the eigenmode"
-                " extraction method has ran successfully."
-                )
+                " extraction method has ran successfully.")
 
         with open(filepath, 'rb') as handle:
             eig = pickle.load(handle)
