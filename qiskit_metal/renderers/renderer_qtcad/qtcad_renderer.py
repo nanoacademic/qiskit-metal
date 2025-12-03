@@ -778,7 +778,7 @@ class QQTCADRenderer(QRendererAnalysis):
         Args:
             geometry_file (Optional[str], optional): File path to which to save
               the geometry file. If `None`, uses the value of the `geo_filepath`
-            entry in QQTCADRenderer’s options dictionary. Default: `None`.
+              entry in QQTCADRenderer’s options dictionary. Default: `None`.
 
         Returns:
             str: File path to the exported geometry file.
@@ -799,6 +799,7 @@ class QQTCADRenderer(QRendererAnalysis):
     def export_mesh(
         self,
         mesh_file: Optional[str] = None,
+        geometry_file: Optional[str] = None,
     ) -> tuple[str, str | None]:
         """Export the mesh and, if AMR is enabled, the geometry file.
 
@@ -808,6 +809,9 @@ class QQTCADRenderer(QRendererAnalysis):
             mesh_file (Optional[str], optional): File path to which to save the
               mesh file. If `None`, uses the value of the `mesh_filepath`
               entry in QQTCADRenderer’s options dictionary. Default: `None`.
+            geometry_file (Optional[str], optional): File path to which to save
+              the geometry file. If `None`, uses the value of the `geo_filepath`
+              entry in QQTCADRenderer’s options dictionary. Default: `None`.
 
         Returns:
             tuple[str, str | None]: If AMR is enabled, 2-tuple with the file
@@ -816,8 +820,16 @@ class QQTCADRenderer(QRendererAnalysis):
         """
 
         geo_file = None
-        if self._options["adaptive"]:
-            geo_file = self.export_geometry()
+        if geometry_file is None:
+            if self._options["adaptive"]:
+                geo_file = self.export_geometry()
+        else:
+            warn_msg = (
+                "The keyword argument `geometry_file` of the `export_mesh` method is"
+                " deprecated."
+                " Please use the method `export_geometry` directly.")
+            self.logger.warning(warn_msg)
+            geo_file = self.export_geometry(geometry_file)
 
         if mesh_file is None:
             self.mesh_file = self._options["mesh_filepath"]
